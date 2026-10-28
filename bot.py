@@ -1,9 +1,11 @@
 import os
+import asyncio
 import sqlite3
 import random
 import json
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -91,6 +93,14 @@ def init_db():
                 "ADD COLUMN paused_until TEXT"
             )
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS published_tickets (
+                game_id INTEGER NOT NULL,
+                ticket_no INTEGER NOT NULL,
+                published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (game_id, ticket_no)
+            )
+        """)
 def generate_ticket():
     while True:
         grid = [[None for _ in range(9)] for _ in range(3)]
@@ -636,6 +646,19 @@ async def publishtickets(
     send_errors = []
 
     for ticket in tickets:
+        with sqlite3.connect(DB_NAME) as conn:
+            already_published = conn.execute(
+                """
+                SELECT 1
+                FROM published_tickets
+                WHERE game_id = ? AND ticket_no = ?
+                """,
+                (game_id, ticket["ticket_no"])
+            ).fetchone()
+
+        if already_published:
+            continue
+
         grid = json.loads(ticket["grid_json"])
 
         rows = []
@@ -653,13 +676,38 @@ async def publishtickets(
         )
 
         # Публикуем билет в общем чате
-        await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text=f"<pre>{ticket_text}</pre>",
-            parse_mode="HTML",
-            **send_options
-        )
+        while True:
+            try:
+                await context.bot.send_message(
+                    chat_id=GROUP_CHAT_ID,
+                    text=f"<pre>{ticket_text}</pre>",
+                    parse_mode="HTML",
+                    **send_options
+                )
+                break
+            except RetryAfter as error:
+                wait_time = (
+                    error.retry_after.total_seconds()
+                    if hasattr(error.retry_after, "total_seconds")
+                    else float(error.retry_after)
+                )
+                print(
+                    f"Telegram ограничил отправку билета "
+                    f"№{ticket['ticket_no']}. "
+                    f"Ждём {wait_time} секунд."
+                )
+                await asyncio.sleep(wait_time + 1)
 
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO published_tickets
+                    (game_id, ticket_no)
+                VALUES (?, ?)
+                """,
+                (game_id, ticket["ticket_no"])
+            )
+       
         # Ищем Telegram ID владельца билета
         username = str(ticket["username"]).strip().lstrip("@").lower()
 
